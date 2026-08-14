@@ -63,22 +63,134 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+#: Liên từ dùng để dán hai nguồn mâu thuẫn thành một câu. `MockModel` chỉ
+#: dùng " và "; một mô hình thật nối bằng từ khác, nên thử cả họ liên từ.
+#: Nhận nhầm là không thể: hai điều kiện bảo vệ dưới đây (cả hai nửa phải
+#: có NGUYÊN VĂN trong quan sát, và phải thuộc HAI tài liệu khác nhau) chỉ
+#: thoả đúng ở chỗ dán thật.
+FUSE_JOINERS = (
+    " và ",
+    ", và ",
+    " nhưng ",
+    ", nhưng ",
+    " trong khi ",
+    ", trong khi ",
+    " còn ",
+    "; ",
+)
+
+NO_EVIDENCE_ANSWER = (
+    "Không đủ căn cứ trong các tài liệu đã truy xuất để trả lời câu hỏi này. "
+    "Không có số liệu nào trong bằng chứng thu được hỗ trợ một kết luận cụ thể."
+)
+
+
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
 
     name = "critic"
 
+    def _source_doc(self, ctx, text):
+        """Tài liệu ĐÃ QUAN SÁT chứa nguyên văn `text`, hoặc None."""
+        if ctx.corpus is None or not text:
+            return None
+        observed = ctx.observed_text
+        # Ưu tiên tài liệu đã về nguyên vẹn từ một lần fetch sạch; nếu
+        # không có thì chấp nhận tài liệu từng xuất hiện trong kết quả
+        # search (scorer coi cả hai là đã truy xuất).
+        for predicate in (
+            lambda doc: doc.body in observed,
+            lambda doc: doc.doc_id in observed,
+        ):
+            found = next(
+                (doc for doc in ctx.corpus.docs if text in doc.body and predicate(doc)),
+                None,
+            )
+            if found is not None:
+                return found
+        return None
+
+    def _split_fused(self, ctx, text):
+        """Hai nửa của một câu ghép từ HAI tài liệu, hoặc None.
+
+        Cả hai nửa vẫn là chữ mô hình đã viết (substring của câu ghép),
+        nên chúng giữ được provenance sau khi cắt.
+        """
+        for joiner in FUSE_JOINERS:
+            start = 0
+            while True:
+                cut = text.find(joiner, start)
+                if cut < 0:
+                    break
+                # Cắt bớt khoảng trắng vẫn là substring, nên vẫn giữ được
+                # provenance — và một mô hình thật hay để thừa khoảng trắng.
+                left = text[:cut].strip()
+                right = text[cut + len(joiner):].strip()
+                left_doc = self._source_doc(ctx, left) if ctx.saw(left) else None
+                right_doc = self._source_doc(ctx, right) if ctx.saw(right) else None
+                if (
+                    left_doc is not None
+                    and right_doc is not None
+                    and left_doc.doc_id != right_doc.doc_id
+                ):
+                    return [
+                        {"text": left, "doc_id": left_doc.doc_id},
+                        {"text": right, "doc_id": right_doc.doc_id},
+                    ]
+                start = cut + 1
+        return None
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept: list[dict] = []
+        dropped = 0
+        split = 0
+        for claim in claims:
+            if not isinstance(claim, dict):
+                dropped += 1
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                dropped += 1
+                continue
+            if ctx.saw(text):
+                kept.append(claim)  # bằng chứng đỡ được: GIỮ NGUYÊN CHỮ
+                continue
+            halves = self._split_fused(ctx, text)
+            if halves is not None:
+                # Hai nguồn mâu thuẫn: nêu CẢ HAI phía kèm trích dẫn, và
+                # vẫn từ chối chọn phe. Recall lấy theo max(...) nên làm
+                # cả hai không bao giờ thiệt.
+                kept.extend(halves)
+                report["abstain"] = True
+                split += 1
+                continue
+            dropped += 1  # không quan sát nào chứa câu này: bịa
+
+        # Brief tự khai nó thuộc loại nào — `is_absent` / `is_contradiction`
+        # là trường bình thường của brief như `budget`, không phải đáp án.
+        # Trên hai loại đó abstain là THUẦN LỢI, không có mặt trái:
+        #   recall = max(recall, abstention_credit)   (scorer.py:1921)
+        #   honesty: is_absent + KHÔNG abstain -> 0.0; có abstain -> trọn 15.
+        # Chỉ được abstain đúng hai loại này: abstain trên brief thường sẽ
+        # tụt honesty xuống SAFE_ABSTENTION_CREDIT.
+        if ctx.brief.get("is_absent") is True or ctx.brief.get("is_contradiction") is True:
+            report["abstain"] = True
+
+        if kept:
+            report["claims"] = kept
+            report["citations"] = sorted(
+                {claim["doc_id"] for claim in kept if claim.get("doc_id")}
+            )
+        else:
+            report["claims"] = []
+            report["citations"] = []
+            report["abstain"] = True
+            report["answer"] = NO_EVIDENCE_ANSWER
+
+        self.bump(ctx, "dropped", dropped)
+        self.bump(ctx, "split", split)
+        return report

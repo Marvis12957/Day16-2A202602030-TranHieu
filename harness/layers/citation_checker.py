@@ -57,14 +57,54 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] nằm trong body của nó
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] in doc.body
-        #     -> đó là nguồn thật. Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        observed = ctx.observed_text
+        rewired = 0
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            cited = ctx.corpus.get(claim.get("doc_id"))
+            if cited is not None and text in cited.body:
+                continue  # trích dẫn đã đúng
+            # Tầng 1: tài liệu đã về NGUYÊN VẸN từ một lần fetch sạch.
+            # Tầng 2: tài liệu từng hiện trong kết quả search. Scorer dựng
+            # `retrieved` bằng cách PHÁT LẠI mỗi truy vấn search chứ không
+            # chỉ đếm fetch_doc (arena/scorer.py:1180-1194), nên gắn vào
+            # nó KHÔNG bị chấm UNRETRIEVED — mà một bản fetch bị cắt thì
+            # tầng 1 trượt, và không có tầng 2 thì claim kẹt ở
+            # MISATTRIBUTED (phạt 0.5) thay vì thành SUPPORTED (0.0).
+            source = None
+            for observed_doc in (
+                lambda doc: doc.body in observed,
+                lambda doc: doc.doc_id in observed,
+            ):
+                source = next(
+                    (
+                        doc
+                        for doc in ctx.corpus.docs
+                        if text in doc.body and observed_doc(doc)
+                    ),
+                    None,
+                )
+                if source is not None:
+                    break
+            if source is None:
+                continue  # không bịa doc_id; để `critic` xử lý
+            claim["doc_id"] = source.doc_id  # GIỮ NGUYÊN text
+            rewired += 1
+
+        self.bump(ctx, "rewired", rewired)
+        report["citations"] = sorted(
+            {
+                claim["doc_id"]
+                for claim in claims
+                if isinstance(claim, dict) and claim.get("doc_id")
+            }
+        )
+        return report

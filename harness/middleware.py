@@ -118,6 +118,21 @@ class Middleware:
     def label(self) -> str:
         return self.name or type(self).__name__
 
+    def bump(self, ctx, key: str, delta: int = 1) -> int:
+        """Increment a debug counter inside THIS layer's own namespace.
+
+        `ctx.state` is one dict shared by every layer, so flat keys make
+        "which layer wrote this" unanswerable the moment two layers pick
+        the same name. Bucketing by `label` keeps each layer's numbers its
+        own: `ctx.state["critic"]["dropped"]` says who and what.
+
+        Counters only — `Trace.emit` stores a REFERENCE to whatever it is
+        handed, so anything that ends up on the trace must stay a scalar.
+        """
+        bucket = ctx.state.setdefault(self.label, {})
+        bucket[key] = bucket.get(key, 0) + delta
+        return bucket[key]
+
     # -- once per run --------------------------------------------------
 
     def before_agent(self, ctx) -> None:

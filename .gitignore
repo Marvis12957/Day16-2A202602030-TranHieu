@@ -4,7 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-
+.env/
 # Test + tooling caches
 .pytest_cache/
 .mypy_cache/
@@ -17,6 +17,12 @@ runs/
 # Instructor-only phase material. NEVER present in this bundle, and never
 # committed if it ever lands here: it is how the scored round stays scored.
 phases/private/
+
+# Thông tin xác thực của đường chạy model thật. README §9 bảo nộp bài bằng
+# `git add -A`, nên một file .env không được bỏ qua sẽ đẩy thẳng API key lên
+# remote của giảng viên.
+.env
+.env.*
 
 # macOS
 .DS_Store
